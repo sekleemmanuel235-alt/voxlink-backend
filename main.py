@@ -14,6 +14,8 @@ import secrets
 import asyncio
 import base64
 import uuid
+import shutil
+from pathlib import Path
 import hmac
 import hashlib as hl
 from datetime import datetime, timedelta
@@ -26,7 +28,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 from sqlalchemy import (
     create_engine, Column, String, Boolean, Integer,
@@ -144,7 +146,23 @@ class UserModel(Base):
         back_populates="owner",
         cascade="all, delete-orphan"
     )
+    posts = relationship(
+        "PostModel",
+        back_populates="owner",
+        cascade="all, delete-orphan"
+    )
 
+    stories = relationship(
+        "StoryModel",
+        back_populates="owner",
+        cascade="all, delete-orphan"
+    )
+
+    creator_revenues = relationship(
+        "CreatorRevenueModel",
+        back_populates="owner",
+        cascade="all, delete-orphan"
+    )
 
 class ContactModel(Base):
     __tablename__ = "contacts"
@@ -233,6 +251,62 @@ class PremiumEventModel(Base):
     raw_payload     = Column(Text, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
 
+class PostModel(Base):
+    __tablename__ = "posts"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"))
+    caption = Column(Text, default="")
+    media_url = Column(String, nullable=False)
+    media_type = Column(String, default="video")
+    views = Column(Integer, default=0)
+    likes_count = Column(Integer, default=0)
+    comments_count = Column(Integer, default=0)
+    shares_count = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    owner = relationship("UserModel", back_populates="posts")
+
+class StoryModel(Base):
+    __tablename__ = "stories"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"))
+    media_url = Column(String, nullable=False)
+    media_type = Column(String, default="image")
+    views = Column(Integer, default=0)
+    expires_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    owner = relationship("UserModel", back_populates="stories")
+
+class PostLikeModel(Base):
+    __tablename__ = "post_likes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    post_id = Column(String, ForeignKey("posts.id", ondelete="CASCADE"))
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class PostCommentModel(Base):
+    __tablename__ = "post_comments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    post_id = Column(String, ForeignKey("posts.id", ondelete="CASCADE"))
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"))
+    comment = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+class CreatorRevenueModel(Base):
+    __tablename__ = "creator_revenues"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String, ForeignKey("users.id", ondelete="CASCADE"))
+    amount_usd = Column(Float, default=0.0)
+    source = Column(String, default="creator_fund")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    owner = relationship("UserModel", back_populates="creator_revenues")
 
 Base.metadata.create_all(bind=engine)
 
@@ -1023,9 +1097,209 @@ async def synthesize_endpoint(
 # ═══════════════════════════════════════════════════════════════════
 # 16. APPELS
 # ═══════════════════════════════════════════════════════════════════
+class CreatePostResponse(BaseModel):
+    id: str
+    media_url: str
+    caption: str
+
 class StartCallReq(BaseModel):
     callee_id: str
 
+@app.post("/api/v4/posts/create", response_model=CreatePostResponse)
+async def create_post(
+    caption: str = Form(""),
+    media: UploadFile = File(...),
+    uid: str = Depends(get_uid),
+    db: Session = Depends(get_db)
+):
+    ext = Path(media.filename).suffix.lower()
+    filename = f"{uuid.uuid4()}{ext}"
+
+    save_path = Path("uploads/posts") / filename
+
+    with open(save_path, "wb") as buffer:
+        shutil.copyfileobj(media.file, buffer)
+
+    post = PostModel(
+        user_id=uid,
+        caption=caption,
+        media_url=f"/uploads/posts/{filename}",
+        media_type="video" if ext in [".mp4", ".mov", ".mkv"] else "image"
+    )
+
+    db.add(post)
+    db.commit()
+    db.refresh(post)
+
+    return CreatePostResponse(
+        id=post.id,
+        media_url=post.media_url,
+        caption=post.caption
+    )
+
+@app.get("/uploads/posts/{filename}")
+def get_post_file(filename: str):
+    file_path = Path("uploads/posts") / filename
+
+    if not file_path.exists():
+        raise HTTPException(404, "Fichier introuvable")
+
+    return FileResponse(str(file_path))
+
+@app.get("/api/v4/posts/feed")
+def get_feed(
+    limit: int = 20,
+    db: Session = Depends(get_db)
+):
+    posts = (
+        db.query(PostModel)
+        .order_by(PostModel.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return [
+        {
+            "id": p.id,
+            "user_id": p.user_id,
+            "caption": p.caption,
+            "media_url": p.media_url,
+            "media_type": p.media_type,
+            "views": p.views,
+            "likes_count": p.likes_count,
+            "comments_count": p.comments_count,
+            "shares_count": p.shares_count,
+            "created_at": p.created_at.isoformat()
+        }
+        for p in posts
+    ]
+
+@app.post("/api/v4/posts/{post_id}/like")
+def like_post(
+    post_id: str,
+    uid: str = Depends(get_uid),
+    db: Session = Depends(get_db)
+):
+    post = db.query(PostModel).filter(PostModel.id == post_id).first()
+    if not post:
+        raise HTTPException(404, "Post introuvable")
+
+    existing = (
+        db.query(PostLikeModel)
+        .filter(
+            PostLikeModel.post_id == post_id,
+            PostLikeModel.user_id == uid
+        )
+        .first()
+    )
+
+    if existing:
+        return {"status": "already_liked"}
+
+    db.add(
+        PostLikeModel(
+            post_id=post_id,
+            user_id=uid
+        )
+    )
+
+    post.likes_count += 1
+    db.commit()
+
+    return {
+        "status": "liked",
+        "likes_count": post.likes_count
+    }
+
+class AddCommentReq(BaseModel):
+    comment: str
+
+
+@app.post("/api/v4/posts/{post_id}/comment")
+def comment_post(
+    post_id: str,
+    req: AddCommentReq,
+    uid: str = Depends(get_uid),
+    db: Session = Depends(get_db)
+):
+    post = db.query(PostModel).filter(PostModel.id == post_id).first()
+
+    if not post:
+        raise HTTPException(404, "Post introuvable")
+
+    db.add(
+        PostCommentModel(
+            post_id=post_id,
+            user_id=uid,
+            comment=req.comment
+        )
+    )
+
+    post.comments_count += 1
+
+    db.commit()
+
+    return {
+        "status": "comment_added",
+        "comments_count": post.comments_count
+    }
+
+class CreateStoryResponse(BaseModel):
+    id: str
+    media_url: str
+
+
+@app.post("/api/v4/stories/create", response_model=CreateStoryResponse)
+async def create_story(
+    media: UploadFile = File(...),
+    uid: str = Depends(get_uid),
+    db: Session = Depends(get_db)
+):
+    ext = Path(media.filename).suffix.lower()
+    filename = f"{uuid.uuid4()}{ext}"
+
+    save_path = Path("uploads/stories") / filename
+
+    with open(save_path, "wb") as buffer:
+        shutil.copyfileobj(media.file, buffer)
+
+    story = StoryModel(
+        user_id=uid,
+        media_url=f"/uploads/stories/{filename}",
+        media_type="video" if ext in [".mp4", ".mov", ".avi"] else "image",
+        expires_at=datetime.utcnow() + timedelta(hours=24)
+    )
+
+    db.add(story)
+    db.commit()
+    db.refresh(story)
+
+    return CreateStoryResponse(
+        id=story.id,
+        media_url=story.media_url
+    )
+
+@app.get("/api/v4/stories/feed")
+def get_stories(
+    db: Session = Depends(get_db)
+):
+    stories = (
+        db.query(StoryModel)
+        .filter(StoryModel.expires_at > datetime.utcnow())
+        .all()
+    )
+
+    return [
+        {
+            "id": s.id,
+            "user_id": s.user_id,
+            "media_url": s.media_url,
+            "media_type": s.media_type,
+            "views": s.views,
+            "expires_at": s.expires_at.isoformat()
+        }
+        for s in stories
+    ]
 
 @app.post("/api/v4/calls/start", status_code=201)
 def start_call(
