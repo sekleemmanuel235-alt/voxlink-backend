@@ -164,6 +164,18 @@ class UserModel(Base):
         cascade="all, delete-orphan"
     )
 
+    followers = relationship(
+        "FollowModel",
+        foreign_keys="FollowModel.following_id",
+        cascade="all, delete-orphan"
+    )
+
+    following = relationship(
+        "FollowModel",
+        foreign_keys="FollowModel.follower_id",
+        cascade="all, delete-orphan"
+    )
+
 class ContactModel(Base):
     __tablename__ = "contacts"
 
@@ -307,6 +319,25 @@ class CreatorRevenueModel(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     owner = relationship("UserModel", back_populates="creator_revenues")
+
+class FollowModel(Base):
+    __tablename__ = "follows"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    follower_id = Column(
+        String,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    following_id = Column(
+        String,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
 
@@ -775,17 +806,90 @@ def update_me(
 
 
 @app.get("/api/v4/profile/{username}")
-def get_profile(username: str, db: Session = Depends(get_db)):
+def get_profile(
+    username: str,
+    uid: str = Depends(get_uid),
+    db: Session = Depends(get_db)
+):
     u = db.query(UserModel).filter(UserModel.username == username).first()
     if not u:
         raise HTTPException(404, "Utilisateur introuvable")
+
+    followers_count = db.query(FollowModel).filter(
+        FollowModel.following_id == u.id
+    ).count()
+
+    following_count = db.query(FollowModel).filter(
+        FollowModel.follower_id == u.id
+    ).count()
+
+    is_following = db.query(FollowModel).filter(
+        FollowModel.follower_id == uid,
+        FollowModel.following_id == u.id
+    ).first() is not None
+
     return {
-        "id": u.id, "username": u.username, "fullname": u.fullname,
-        "bio": u.bio, "avatar_url": u.avatar_url,
-        "is_verified": u.is_verified, "is_premium": u.is_premium,
-        "system_lang": u.system_lang
+        "id": u.id,
+        "username": u.username,
+        "fullname": u.fullname,
+        "bio": u.bio,
+        "avatar_url": u.avatar_url,
+        "is_verified": u.is_verified,
+        "is_premium": u.is_premium,
+        "system_lang": u.system_lang,
+        "followers_count": followers_count,
+        "following_count": following_count,
+        "is_following": is_following
     }
 
+@app.post("/api/v4/follow/{user_id}")
+def follow_user(
+    user_id: str,
+    uid: str = Depends(get_uid),
+    db: Session = Depends(get_db)
+):
+    if uid == user_id:
+        raise HTTPException(400, "Vous ne pouvez pas vous suivre vous-même.")
+
+    target = db.query(UserModel).filter(UserModel.id == user_id).first()
+    if not target:
+        raise HTTPException(404, "Utilisateur introuvable.")
+
+    existing = db.query(FollowModel).filter(
+        FollowModel.follower_id == uid,
+        FollowModel.following_id == user_id
+    ).first()
+
+    if existing:
+        return {"status": "already_following"}
+
+    db.add(FollowModel(
+        follower_id=uid,
+        following_id=user_id
+    ))
+    db.commit()
+
+    return {"status": "following"}
+
+
+@app.post("/api/v4/unfollow/{user_id}")
+def unfollow_user(
+    user_id: str,
+    uid: str = Depends(get_uid),
+    db: Session = Depends(get_db)
+):
+    follow = db.query(FollowModel).filter(
+        FollowModel.follower_id == uid,
+        FollowModel.following_id == user_id
+    ).first()
+
+    if not follow:
+        return {"status": "not_following"}
+
+    db.delete(follow)
+    db.commit()
+
+    return {"status": "unfollowed"}
 
 # ═══════════════════════════════════════════════════════════════════
 # 13. CONTACTS (avec blocage)
