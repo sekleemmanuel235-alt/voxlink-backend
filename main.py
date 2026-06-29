@@ -176,6 +176,12 @@ class UserModel(Base):
         cascade="all, delete-orphan"
     )
 
+    notifications = relationship(
+        "NotificationModel",
+        foreign_keys="NotificationModel.user_id",
+        cascade="all, delete-orphan"
+    )
+
 class ContactModel(Base):
     __tablename__ = "contacts"
 
@@ -338,6 +344,29 @@ class FollowModel(Base):
     )
 
     created_at = Column(DateTime, default=datetime.utcnow)
+
+class NotificationModel(Base):
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    user_id = Column(
+        String,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    actor_id = Column(
+        String,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False
+    )
+
+    notification_type = Column(String, nullable=False)
+    reference_id = Column(String, nullable=True)
+    is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 
 Base.metadata.create_all(bind=engine)
 
